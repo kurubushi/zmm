@@ -56,7 +56,7 @@ zmm_files() {
 
     cd "$dotfilesdir/$package"
     rm -rf ".dst"
-    make -s install HOME=".dst"
+    make -s install HOME=".dst" >/dev/null 2>&1
     find ".dst/" -type f | awk -v home="$homedir" '{ sub(".dst", home); print }'
     rm -rf ".dst"
 }
