@@ -1,0 +1,156 @@
+#!/bin/bash -eu
+#
+# zmm - A tiny dotfiles manager with Git
+#
+# This script is a simple dotfiles manager that uses Git to manage dotfiles.
+# It installs dotfiles with your Makefile and commits changes to the Git repository.
+#
+# 0. Run `zmm init` to create the bare Git repository at `~/.zmm/home.git`.
+# 1. Create a Makefile to install dotfiles for `<package>`
+#    at `~/.zmm/dotfiles/<package>/Makefile`.
+# 2. Run `zmm store <package>` to store original files to the Git repository
+#    and avoid conflicts with the installed files
+# 3. Run `zmm install <package>` to install files and manages file changes.
+# 4. Manage installed files with `zmm git` command.
+#
+# Copyright 2025 @kurubushi
+#
+
+homedir="${ZMM_HOMEDIR:-$HOME}"
+dotfilesdir="${ZMM_DOTFILESDIR:-$HOME/.zmm/dotfiles}"
+gitdir="${ZMM_GITDIR:-$HOME/.zmm/home.git}"
+
+# Print error messages to stderr.
+warn() {
+    echo "$@" >&2
+}
+
+# Print help message.
+zmm_help() {
+    warn "Usage: zmm <command> [<arguments>]"
+    warn
+    warn "Commands:"
+    warn "  help"
+    warn "  init"
+    warn "  git <git-command> [<git-arguments>...]"
+    warn "  files <package>..."
+    warn "  store <package>..."
+    warn "  install <package>..."
+}
+
+# Run git command with the specified gitdir and work-tree.
+zmm_git() {
+    git --git-dir="$gitdir" --work-tree="$homedir" "$@"
+}
+
+# Initialize the git repository for files managed by zmm.
+zmm_init() {
+    mkdir -p "$gitdir"
+    git init --bare "$gitdir"
+    zmm_git config --local status.showUntrackedFiles no
+}
+
+# Get the list of files to be installed.
+zmm_files() {
+    package="$1"
+
+    cd "$dotfilesdir/$package"
+    rm -rf ".dst"
+    make -s install HOME=".dst"
+    find ".dst/" -type f | awk -v home="$homedir" '{ sub(".dst", home); print }'
+    rm -rf ".dst"
+}
+
+# Store original files to the git repository.
+zmm_store() {
+    package="$1"
+
+    readarray -t files < <(zmm_files "$package")
+
+    # Add original files.
+    for file in "${files[@]}"; do
+        [[ -f "$file" ]]  \
+            && zmm_git add "$file"
+    done
+
+    # Commit files if there are changes.
+    zmm_git diff --cached --quiet --exit-code \
+        || zmm_git commit -m ":package: store original $package config"
+}
+
+# Install files and commit changes.
+zmm_install() {
+    package="$1"
+
+    readarray -t files < <(zmm_files "$package")
+    untracked_files=()
+
+    # Check if there are untracked original files.
+    for file in "${files[@]}"; do
+        zmm_git ls-files --error-unmatch "$file" > /dev/null 2>&1 \
+            || [[ ! -f "$file" ]] \
+            || untracked_files+=("$file")
+    done
+
+    # Print untracked files and exit if there are any.
+    if [[ "${#untracked_files[@]}" = 1 ]]; then
+        warn "Untracked file exists: ${untracked_files[0]}"
+        exit 1
+    elif [[ "${#untracked_files[@]}" -gt 1 ]]; then
+        warn "Untracked files exist:"
+        for file in "${untracked_files[@]}"; do
+            warn "$file"
+        done
+        exit 1
+    fi
+
+    # Install files.
+    cd "$dotfilesdir/$package"
+    make install HOME="$homedir"
+
+    # Add installed files.
+    for file in "${files[@]}"; do
+        zmm_git add "$file"
+    done
+
+    # Commit files if there are changes.
+    zmm_git diff --cached --quiet --exit-code \
+        || zmm_git commit -m ":package: update $package config"
+}
+
+# Main
+
+if [[ $# -lt 1 ]]; then
+    zmm_help
+    exit 1
+fi
+
+command="$1"
+shift
+arguments=("$@")
+
+case "$command" in
+    "help")
+        zmm_help;;
+    "init")
+        zmm_init;;
+    "git")
+        zmm_git "${arguments[@]}";;
+    "files")
+        for package in "${arguments[@]}"; do
+            zmm_files "$package"
+        done;;
+    "store")
+        for package in "${arguments[@]}"; do
+            zmm_store "$package"
+        done;;
+    "install")
+        for package in "${arguments[@]}"; do
+            zmm_install "$package"
+        done;;
+    *)
+        warn "Unknown command: $command"
+        warn ""
+        zmm_help
+        exit 1;;
+esac
