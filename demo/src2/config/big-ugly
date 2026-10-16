@@ -1,0 +1,5 @@
+[pilot]
+autopilot = off
+
+[arms]
+body = cannon

@@ -1,0 +1,5 @@
+[pilot]
+autopilot = @AUTOPILOT@
+
+[arms]
+body = cannon

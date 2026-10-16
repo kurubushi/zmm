@@ -1,0 +1,593 @@
+#!/usr/bin/env bash
+#
+# zmm - a tiny dotfiles manager with make and git
+#
+# Copyright (c) 2026 kurubushi
+# SPDX-License-Identifier: MIT
+
+set -eu
+
+ZMM_VERSION=0.1.0-beta
+
+# The home and zmm directories end with /, to join and strip them as they are
+# (squeeze the slashes. e.g. //.zmm => /.zmm/)
+ZMM_HOME=$(printf '%s\n' "${ZMM_HOME:-$HOME}/" | tr -s /)
+ZMM_DIR=$(printf '%s\n' "${ZMM_DIR:-${ZMM_HOME}.zmm}/" | tr -s /)
+REPO="${ZMM_DIR}local.git"
+DRAFT="${ZMM_DIR}draft"
+PROOF="${ZMM_DIR}proof"
+PERM="${ZMM_DIR}perm"
+PERM=${PERM#"$ZMM_HOME"} # Relative, as it is in every work tree
+MAKEFILE="${ZMM_DIR}src/Makefile"
+
+VERBOSE=
+CLEAN=
+
+# Show the commands and the files
+help() {
+	[ $# -eq 0 ] || usage
+	cat <<-EOF
+		usage: zmm <command> [<args>]
+
+		Setup commands
+		   init              Create the zmm directory
+
+		Install commands
+		   make [<opts>]     Make install into the draft branch, and stop to check it
+		   install [<opts>]  Make install into the draft branch, and merge it into the home directory
+		     --continue      Continue the install that stopped
+		     --abort         Throw away the install that stopped
+
+		Install options
+		   -v, --verbose     Show the recipes that make runs
+		   --clean           Make clean before make install, to make everything again
+
+		Ancillary commands
+		   git <args>        Run git in the home directory, on the master branch
+		   draft-git <args>  Run git in the draft directory, on the draft branch
+		   proof-git <args>  Run git in the proof directory, on the proof branch
+		   dir               Show the zmm directory
+		   version           Show the version
+		   help              Show this help
+
+		Files and directories
+		   home directory     $ZMM_HOME, set by ZMM_HOME, with the master branch checked out
+		   zmm directory      $ZMM_DIR, set by ZMM_DIR
+		   Makefile           $MAKEFILE
+		   local repository   $REPO, holding the branches
+		   draft directory    $DRAFT, with the draft branch checked out
+		   proof directory    $PROOF, with the proof branch checked out
+	EOF
+}
+
+# Show the help for a wrong command line, and exit
+usage() {
+	help >&2
+	exit 129
+}
+
+# Show a message
+msg() {
+	echo "zmm: $1" >&2
+}
+
+# Show a hint
+hint() {
+	echo "hint: $1" >&2
+}
+
+# Show a warning, and go on
+warn() {
+	echo "warning: $1" >&2
+}
+
+# Refuse to go on, with hints, and exit
+die() {
+	echo "fatal: $1" >&2
+	shift
+	[ $# -eq 0 ] || printf 'hint: %s\n' "$@" >&2
+	exit 128
+}
+
+# Show the version
+version() {
+	[ $# -eq 0 ] || usage
+	echo "zmm version $ZMM_VERSION"
+}
+
+# Show the zmm directory
+# (not "dir", which would hide the dir command)
+zmm_dir() {
+	[ $# -eq 0 ] || usage
+	echo "$ZMM_DIR"
+}
+
+# Run git in $ZMM_HOME
+home_git() {
+	git -C "$ZMM_HOME" --git-dir="$REPO" --work-tree="$ZMM_HOME" "$@"
+}
+
+# Run git in the draft directory
+draft_git() {
+	git -C "$DRAFT" "$@"
+}
+
+# Run git in the proof directory
+proof_git() {
+	git -C "$PROOF" "$@"
+}
+
+# Refuse to go on without what "zmm init" makes
+check_init() {
+	[ -d "$REPO" ] || die "zmm is not initialized" 'Run "zmm init".'
+	[ -d "$DRAFT" ] ||
+		die "no draft directory at $DRAFT" \
+			'Restore it with "zmm git worktree prune" and "zmm git worktree add '"$DRAFT"' draft".'
+	[ -d "$PROOF" ] ||
+		die "no proof directory at $PROOF" \
+			'Restore it with "zmm git worktree prune" and "zmm git worktree add '"$PROOF"' proof".'
+}
+
+# Tell whether an install stopped in proof, by a conflict or by git refusing to write $ZMM_HOME
+install_stopped() {
+	if proof_git rev-parse -q --verify MERGE_HEAD >/dev/null; then
+		return 0
+	fi
+	! proof_git merge-base --is-ancestor proof master
+}
+
+# Dump the modes under $1 ("0644 .bashrc", "0700 .ssh/") of the files from "git ls-files -z", with their directories
+# (a subshell for cd, as stat prints the paths as given)
+dump_perm() (
+	cd "$1"
+	tr '\0' '\n' |
+		grep -vxF "$PERM" |
+		awk '{ print; while (sub(/\/[^\/]*$/, "")) print $0 "/" }' |
+		LC_ALL=C sort -u |
+		tr '\n' '\0' |
+		# One stat for all: -c for GNU, -f for BSD
+		if stat -c %a . >/dev/null 2>&1; then
+			xargs -0 -r stat -c '%a %A %n' -- 2>/dev/null
+		else
+			xargs -0 -r stat -f '%Lp %Sp %N' -- 2>/dev/null
+		fi |
+		# No line for a symlink, as it has no mode of its own
+		awk '$2 !~ /^l/ { printf "%04d %s\n", $1, substr($0, length($1 " " $2 " ") + 1) }'
+)
+
+# Load the modes under $1 from the record $2, for the files from "git ls-files -z" and their directories
+load_perm() (
+	cd "$1"
+	# Keep the lines of the tracked paths only, never beyond a symlink, to read them once for each mode
+	# (in the zmm directory, which is private)
+	record=$(mktemp "${ZMM_DIR}perm.XXXXXX")
+	tr '\0' '\n' |
+		awk '{ print; while (sub(/\/[^\/]*$/, "")) print $0 "/" }' |
+		awk 'NR == FNR { tracked[$0]; next } substr($0, index($0, " ") + 1) in tracked' - "$2" >"$record"
+	# One chmod for each mode
+	awk '{ print $1 }' "$record" |
+		sort -u |
+		while read -r mode; do
+			awk -v m="$mode" '$1 == m { print substr($0, length(m) + 2) }' "$record" |
+				tr '\n' '\0' |
+				xargs -0 -r chmod "$mode" -- 2>/dev/null || true
+		done
+	rm "$record"
+)
+
+# Run git in $ZMM_HOME, keeping the modes
+home_git_with_perm() {
+	# Dump the modes, so that git sees the ones changed by hand
+	home_git ls-files -z | dump_perm "$ZMM_HOME" >"$ZMM_HOME$PERM"
+
+	# Run git, making new files private
+	local rc=0
+	(umask 077 && home_git "$@") || rc=$?
+
+	# Load the modes
+	home_git ls-files -z | load_perm "$ZMM_HOME" "$ZMM_HOME$PERM"
+	exit "$rc"
+}
+
+# Initialize for zmm
+init() {
+	[ $# -eq 0 ] || usage
+	[ ! -e "$REPO" ] || die "$REPO already exists"
+	command -v zmm >/dev/null ||
+		die "zmm is not in PATH" \
+			'Git runs "zmm merge-perm" to merge the record of the modes. Put zmm in your PATH.'
+
+	# Make the zmm directory private (the repo will have copies of your secrets)
+	mkdir -p "$ZMM_DIR"
+	chmod 700 "$ZMM_DIR"
+
+	# Make the local repo, and set it up
+	git init -q --bare --initial-branch=master "$REPO"
+	git --git-dir="$REPO" config status.showUntrackedFiles no
+	git --git-dir="$REPO" config merge.conflictStyle zdiff3
+
+	# Let "zmm merge-perm" merge the permission record
+	git --git-dir="$REPO" config merge.zmm-perm.driver 'zmm merge-perm %O %A %B'
+	echo "/$PERM merge=zmm-perm" >>"$REPO/info/attributes"
+
+	# Keep the zmm directory out of $ZMM_HOME's records
+	echo "/${ZMM_DIR#"$ZMM_HOME"}" >>"$REPO/info/exclude"
+
+	# Start master and draft from an empty record of the modes
+	: >"$ZMM_HOME$PERM"
+	home_git add -f "$PERM"
+	home_git commit -q -m 'zmm: init'
+	# --no-track: the draft and proof never follow master, whatever branch.autoSetupMerge says
+	git --git-dir="$REPO" branch --no-track draft master
+	git --git-dir="$REPO" branch --no-track proof master
+
+	# Check out the draft and proof in their directories
+	git --git-dir="$REPO" worktree add -q "$DRAFT" draft
+	git --git-dir="$REPO" worktree add -q "$PROOF" proof
+
+	msg "initialized $REPO"
+}
+
+# Make clean, to make everything again (as the files that the Makefile downloads)
+make_clean() {
+	local makeopts=
+	[ -n "$VERBOSE" ] || makeopts=-s # Silent, unless -v
+	make $makeopts -C "${MAKEFILE%/*}" -f "$MAKEFILE" clean
+
+	msg "made clean in ${MAKEFILE%/*}"
+}
+
+# Empty the draft, and make install into it
+make_into_draft() {
+	local rc
+	# Empty the draft directory (-f: back on the draft, if a fork for symlinks is left)
+	draft_git switch -q -f draft
+	draft_git rm -rq --ignore-unmatch .
+	draft_git clean -ffdxq
+
+	# Make install into the draft, and stage it
+	# (unstage it if make fails, leaving the half output to look at, not to continue)
+	local makeopts=
+	[ -n "$VERBOSE" ] || makeopts=-s # Silent, unless -v
+	make $makeopts -C "${MAKEFILE%/*}" -f "$MAKEFILE" install DESTDIR="$DRAFT" || {
+		rc=$?
+		draft_git reset -q
+		exit "$rc"
+	}
+	# -f: the draft is all of the output, even the ignored files
+	draft_git add -A -f .
+
+	# Record the modes of the output, and stage the record
+	mkdir -p "$DRAFT/${PERM%/*}"
+	draft_git ls-files -z | dump_perm "$DRAFT" >"$DRAFT/$PERM"
+	draft_git add -f "$PERM"
+
+	msg "made the draft in $DRAFT"
+}
+
+# Commit the output of make, if the draft changes
+commit_draft() {
+	# Commit what make_into_draft staged
+	if draft_git diff --cached --quiet; then
+		msg "the draft is unchanged"
+		return
+	fi
+	draft_git commit -q -m 'zmm: update draft'
+
+	msg "committed the draft"
+}
+
+# Commit to master the files in $ZMM_HOME that the merge will touch
+capture_into_master() {
+	# Stage the files in $ZMM_HOME that the merge will touch
+	# --no-renames: list both sides of a rename
+	home_git diff --name-only --no-renames -z master...draft |
+		# Never beyond a symlink: take the symlink nearest to $ZMM_HOME instead
+		while IFS= read -r -d '' path; do
+			dir=$path
+			while [ "$dir" != "${dir%/*}" ]; do
+				dir=${dir%/*}
+				if [ -L "$ZMM_HOME$dir" ]; then
+					path=$dir
+				fi
+			done
+			printf '%s\0' "$path"
+		done |
+		home_git update-index --add --remove -z --stdin
+
+	# Dump the modes, and stage them
+	home_git ls-files -z | dump_perm "$ZMM_HOME" >"$ZMM_HOME$PERM"
+	home_git add -f "$PERM"
+
+	# Commit them to master, if any
+	if ! home_git diff --cached --quiet; then
+		msg "captured the home directory into master"
+		home_git diff --cached --stat
+		home_git commit -q -m 'zmm: capture'
+	fi
+}
+
+# Merge the draft into a fresh proof from master
+merge_draft_into_proof() {
+	local rc skipped merged
+	# Nothing to merge, if the draft is merged into master already
+	if proof_git merge-base --is-ancestor draft master; then
+		msg "the draft is already merged into master"
+		return
+	fi
+
+	# Find the paths in the draft beyond the symlinks in master, which zmm leaves to the symlinks
+	skipped=$(
+		draft_git ls-tree -r -z master |
+			tr '\0' '\n' |
+			awk -F '\t' '$1 ~ /^120000 / { print $2 "/" }' | # The symlinks
+			tr '\n' '\0' |
+			xargs -0 -r git -C "$DRAFT" ls-tree -r -z --name-only draft -- | # The paths beyond symlinks
+			tr '\0' '\n'
+	)
+
+	# Fork the draft without them, if any
+	merged=draft
+	if [ -n "$skipped" ]; then
+		draft_git switch -q --detach draft
+		# --literal-pathspecs: the paths as they are, not as patterns (a path may have "*" in it)
+		printf '%s\n' "$skipped" | tr '\n' '\0' | draft_git --literal-pathspecs rm -q --pathspec-from-file=- --pathspec-file-nul
+		# Record the modes again, of the output still left by make
+		draft_git ls-files -z | dump_perm "$DRAFT" >"$DRAFT/$PERM"
+		draft_git add -f "$PERM"
+		draft_git commit -q -m 'zmm: skip the paths beyond symlinks'
+		merged=$(draft_git rev-parse HEAD)
+		draft_git switch -q draft
+		printf '%s\n' "$skipped" |
+			while IFS= read -r path; do
+				msg "skipped $path, beyond a symlink in the home directory"
+			done
+		hint 'To take them, replace the symlink with "zmm git rm" and "zmm git checkout draft -- <path>".'
+	fi
+
+	# Cut proof from master again, and merge the draft into it
+	proof_git switch -q -C proof master
+	# --no-ff: always make a merge commit, to keep master's first parents as $ZMM_HOME's history
+	proof_git merge -q --no-ff -m 'zmm: merge draft' "$merged" || {
+		rc=$?
+		hint "Resolve the conflicts in $PROOF, and run \"zmm install --continue\"."
+		hint 'To throw it away, run "zmm install --abort".'
+		exit "$rc"
+	}
+
+	msg "merged the draft into proof in $PROOF"
+	proof_git diff --stat master
+}
+
+# Fast-forward master and $ZMM_HOME to proof
+merge_proof_into_master() {
+	local rc
+	# Nothing to do, if proof is in master already
+	if proof_git merge-base --is-ancestor proof master; then
+		return
+	fi
+
+	# Dump the modes, so that git stops before overwriting the ones changed by hand
+	home_git ls-files -z | dump_perm "$ZMM_HOME" >"$ZMM_HOME$PERM"
+
+	# Fast-forward master and $ZMM_HOME to proof, making new files private
+	# --no-overwrite-ignore: stop rather than silently overwrite ignored files in $ZMM_HOME
+	(umask 077 && home_git merge -q --ff-only --no-overwrite-ignore proof) || {
+		rc=$?
+		hint 'Run "zmm install --abort" and "zmm install" again to capture them,'
+		hint 'or move them away, and run "zmm install --continue".'
+		exit "$rc"
+	}
+
+	# Load the modes
+	home_git ls-files -z | load_perm "$ZMM_HOME" "$ZMM_HOME$PERM"
+
+	msg "merged proof into master and the home directory"
+}
+
+# Make install into the draft, and stop there for checking
+# (not "make", which would hide the make command)
+make_only() {
+	[ $# -eq 0 ] || usage
+
+	check_init
+	[ -f "$MAKEFILE" ] || die "no Makefile at $MAKEFILE"
+	! install_stopped ||
+		die "an install is in progress" \
+			'Finish it with "zmm install --continue", or throw it away with "zmm install --abort".'
+
+	if [ -n "$CLEAN" ]; then
+		make_clean
+	fi
+	make_into_draft
+	draft_git diff --cached --stat
+
+	hint 'Check it with "zmm draft-git diff --cached", then run "zmm install --continue".'
+}
+
+# Make install into the draft, and install it into $ZMM_HOME
+install() {
+	[ $# -eq 0 ] || usage
+
+	check_init
+	[ -f "$MAKEFILE" ] || die "no Makefile at $MAKEFILE"
+	! install_stopped ||
+		die "an install is in progress" \
+			'Finish it with "zmm install --continue", or throw it away with "zmm install --abort".'
+	home_git diff --cached --quiet ||
+		die "the home directory has staged changes" \
+			'Commit them with "zmm git commit", or unstage them with "zmm git restore --staged .".'
+
+	if [ -n "$CLEAN" ]; then
+		make_clean
+	fi
+	make_into_draft
+	commit_draft
+	capture_into_master
+	merge_draft_into_proof
+	merge_proof_into_master
+}
+
+# Continue the install where it stopped
+install_continue() {
+	[ $# -eq 0 ] || usage
+
+	check_init
+
+	if install_stopped; then
+		proof_git merge-base --is-ancestor master proof ||
+			die "master has moved since the install stopped" \
+				'Run "zmm install --abort", then "zmm install" again.'
+
+		# Commit the merge, unless committed by hand
+		if proof_git rev-parse -q --verify MERGE_HEAD >/dev/null; then
+			proof_git commit -q --no-edit
+		fi
+		merge_proof_into_master
+	else
+		# After "zmm make"
+		home_git diff --cached --quiet ||
+			die "the home directory has staged changes" \
+				'Commit them with "zmm git commit", or unstage them with "zmm git restore --staged .".'
+
+		commit_draft
+		capture_into_master
+		merge_draft_into_proof
+		merge_proof_into_master
+	fi
+}
+
+# Throw away the install that stopped
+install_abort() {
+	[ $# -eq 0 ] || usage
+
+	check_init
+
+	# Put proof back to master
+	proof_git reset -q --hard master
+	proof_git clean -ffdxq
+}
+
+# Merge the records of the modes path by path, as git's merge driver (%O %A %B: the base, ours to be the result, theirs)
+merge_perm() {
+	[ $# -eq 3 ] || usage
+
+	# All the paths, sorted, after the three records
+	local rc=0
+	cat "$1" "$2" "$3" |
+		sed 's/^[^ ]* //' |
+		LC_ALL=C sort -u |
+		awk '
+			# The three records by the path
+			FILENAME == ARGV[1] { o[substr($0, index($0, " ") + 1)] = $0; next }
+			FILENAME == ARGV[2] { a[substr($0, index($0, " ") + 1)] = $0; next }
+			FILENAME == ARGV[3] { b[substr($0, index($0, " ") + 1)] = $0; next }
+			# Each path
+			{
+				if (a[$0] == b[$0]) r = a[$0]          # the same
+				else if (a[$0] == o[$0]) r = b[$0]     # only theirs changed
+				else if (b[$0] == o[$0]) r = a[$0]     # only ours changed
+				else if (a[$0] == "") r = b[$0]        # ours removed, theirs changed
+				else if (b[$0] == "") r = a[$0]        # theirs removed, ours changed
+				else {
+					print "<<<<<<< ours\n" a[$0] "\n=======\n" b[$0] "\n>>>>>>> theirs"
+					conflict = 1
+					next
+				}
+				if (r != "") print r
+			}
+			END { exit conflict }
+		' "$1" "$2" "$3" - >"$2.merged" || rc=$?
+	mv "$2.merged" "$2"
+	exit "$rc"
+}
+
+main() {
+	[ $# -ge 1 ] || usage
+
+	case $ZMM_HOME in
+	/*) ;;
+	*) die "ZMM_HOME is not an absolute path: $ZMM_HOME" ;;
+	esac
+
+	# Master tracks the record of the modes in the zmm directory
+	case $ZMM_DIR in
+	"$ZMM_HOME"?*) ;;
+	*) die "ZMM_DIR is outside the home directory: $ZMM_DIR" ;;
+	esac
+
+	# Warn when the zmm directory is not private (the repo has copies of your secrets)
+	if [ -d "$ZMM_DIR" ] && [ -z "$(find "$ZMM_DIR" -prune -perm 700)" ]; then
+		warn "the zmm directory is not private: $ZMM_DIR"
+		hint "Run chmod 700 $ZMM_DIR"
+	fi
+
+	local cmd=$1
+	shift
+
+	case $cmd in
+	init)
+		init "$@"
+		;;
+	make)
+		while :; do
+			case ${1-} in
+			-v | --verbose) VERBOSE=1 ;;
+			--clean) CLEAN=1 ;;
+			*) break ;;
+			esac
+			shift
+		done
+		make_only "$@"
+		;;
+	install)
+		case ${1-} in
+		--continue)
+			shift
+			install_continue "$@"
+			;;
+		--abort)
+			shift
+			install_abort "$@"
+			;;
+		*)
+			while :; do
+				case ${1-} in
+				-v | --verbose) VERBOSE=1 ;;
+				--clean) CLEAN=1 ;;
+				*) break ;;
+				esac
+				shift
+			done
+			install "$@"
+			;;
+		esac
+		;;
+	merge-perm)
+		merge_perm "$@"
+		;;
+	git)
+		home_git_with_perm "$@"
+		;;
+	draft-git)
+		draft_git "$@"
+		;;
+	proof-git)
+		proof_git "$@"
+		;;
+	dir)
+		zmm_dir "$@"
+		;;
+	version)
+		version "$@"
+		;;
+	help)
+		help "$@"
+		;;
+	*)
+		usage
+		;;
+	esac
+}
+
+main "$@"
