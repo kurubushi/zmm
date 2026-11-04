@@ -2,4 +2,4 @@
 autopilot = off
 
 [arms]
-body = cannon
+body = large-caliber-cannon

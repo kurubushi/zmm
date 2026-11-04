@@ -1,7 +1,11 @@
 # zmm - a tiny dotfiles manager with make and git
 
-zmm makes your dotfiles with a `Makefile`, and installs them into `$HOME`.
-It uses Git to manage both the changes from the `Makefile` and your local changes, and merges them like this:
+zmm proposes a simple workflow with just make and Git:
+
+- Build your dotfiles with a `Makefile`: no template language to learn.
+- Merge them with your local changes in Git, as a vendor branch.
+
+`zmm` runs this workflow:
 
 ```
   Makefile
@@ -25,7 +29,7 @@ It uses Git to manage both the changes from the `Makefile` and your local change
 where the names in brackets are Git branches:
 
 - `[master]`: History of the home directory
-- `[draft]`: History of the Makefile output, without local changes
+- `[draft]`: History of the Makefile output, without local changes (the vendor branch)
 - `[proof]`: The draft branch merged into the master branch, to resolve conflicts outside the home directory
 
 ## Requirements
@@ -45,15 +49,8 @@ install -m 755 bin/zmm ~/.local/bin/zmm
 
 ```sh
 zmm init
-git clone <your dotfiles repository> ~/.zmm/src   # or write ~/.zmm/src/Makefile
+# create ~/.zmm/src/Makefile (see below)
 zmm install
-```
-
-The `Makefile` installs into `$(DESTDIR)`, which zmm replaces with `$HOME`:
-
-```makefile
-install:
-	install -m 644 config/bashrc $(DESTDIR)/.bashrc
 ```
 
 ## Rules for the Makefile
@@ -62,6 +59,46 @@ install:
 - Install into `$(DESTDIR)`, not `$HOME`
 - Write a `clean` target, if you use `--clean`
 - Put no newlines in the file names of your dotfiles
+
+For example:
+
+```makefile
+install: build/git-prompt.sh
+	install -m 644 config/gitconfig $(DESTDIR)/.gitconfig
+	install -m 644 config/bashrc.$(shell uname -s) $(DESTDIR)/.bashrc
+	install -m 644 build/git-prompt.sh $(DESTDIR)/.git-prompt.sh
+
+build/git-prompt.sh:
+	mkdir -p build
+	curl -fsSL -o build/git-prompt.sh https://raw.githubusercontent.com/git/git/master/contrib/completion/git-prompt.sh
+
+clean:
+	rm -rf build
+
+# ~/.zmm/src
+# ├── Makefile
+# └── config
+#     ├── bashrc.Darwin
+#     ├── bashrc.Linux
+#     └── gitconfig
+
+# ~ (after "zmm install")
+# ├── .bashrc
+# ├── .git-prompt.sh
+# └── .gitconfig
+```
+
+## Secrets
+
+`~/.zmm/local.git` records your `$HOME` as it is, so sharing it is not recommended.
+
+To share a secret, commit it encrypted to `~/.zmm/src`, and decrypt it in the `Makefile` with any tool:
+
+```makefile
+install:
+	gpg -d config/netrc.gpg > $(DESTDIR)/.netrc
+	chmod 600 $(DESTDIR)/.netrc
+```
 
 ## Manage other places
 

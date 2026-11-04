@@ -2,7 +2,7 @@
 assistant = hello, @USER@.
 
 [shell]
-armor = thick
+armor = thickest
 
 [drive]
 mode = 4wd
