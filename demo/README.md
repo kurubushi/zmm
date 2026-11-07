@@ -599,46 +599,373 @@ armor = thickest
 
 ## 5. Makefile の活用
 
-ここまでの `Makefile` は、素材を `install` するだけだった。`Makefile` なら環境に応じて dotfiles を作成したり、ダウンロードしたりもできる ([src4/](src4/)):
+ここまでの `Makefile` は、素材を `install` するだけだった。`Makefile` ならではのレシピを紹介する。
 
-```sh
-rm -rf ~/.zmm-demo/src
-cp -R demo/src4 ~/.zmm-demo/src
+### 5.1 変数を穴埋め
+
+`~/.zmm-demo/src/config/castle-3.in` を作成:
+
+```ini
+[greeting]
+assistant = hello, @USER@.
 ```
 
+`Makefile`:
+
 ```makefile
+install:
+	install -d $(DESTDIR)/.rhodes
+	sed 's/@USER@/$(USER)/' config/castle-3.in > $(DESTDIR)/.rhodes/castle-3
+```
+
+```console
+$ zmm install
+$ cat ~/.rhodes/castle-3
+[greeting]
+assistant = hello, doctor.
+```
+
+### 5.2 ファイルの生成
+
+`~/.zmm-demo/src/build.sh` を作成:
+
+```sh
+echo 'author = Zumama'
+```
+
+`Makefile`:
+
+```makefile
+install:
+	install -d $(DESTDIR)/.rhodes
+	sh build.sh > $(DESTDIR)/.rhodes/big-ugly
+```
+
+```console
+$ zmm install
+$ cat ~/.rhodes/big-ugly
+author = Zumama
+```
+
+### 5.3 ファイルのダウンロード
+
+`Makefile`:
+
+```makefile
+.DELETE_ON_ERROR:
+
 install: build/big-ugly
 	install -d $(DESTDIR)/.rhodes
-	sed 's/@USER@/$(USER)/' config/castle-3.in >$(DESTDIR)/.rhodes/castle-3
-	install -m 644 config/lancet-2.$(shell uname -s) $(DESTDIR)/.rhodes/lancet-2
 	install -m 644 build/big-ugly $(DESTDIR)/.rhodes/big-ugly
 
 build/big-ugly:
 	mkdir -p build
-	curl -fsSL -o build/big-ugly https://raw.githubusercontent.com/kurubushi/zmm/master/demo/acahualla/big-ugly
+	curl -fsSL -o $@ https://raw.githubusercontent.com/kurubushi/zmm/master/demo/acahualla/big-ugly
+	echo '6a80ac6705726fb2da91a732b35f14446b66309ca94608b16a394617603cbcc9  $@' | sha256sum -c --quiet -
 
 clean:
 	rm -rf build
+```
+
+```console
+$ zmm install
+$ cat ~/.rhodes/big-ugly
+[pilot]
+autopilot = off
+
+[arms]
+body = large-caliber-cannon
+```
+
+一度ダウンロードしたら、`build/` に残っている間は取り直さない。取り直すなら `zmm install --clean` (`make clean` してからインストールする)。
+
+### 5.4 環境ごとの分岐
+
+`~/.zmm-demo/src/config/lancet-2.Linux` を作成:
+
+```ini
+[report]
+open = xdg-open
+```
+
+`~/.zmm-demo/src/config/lancet-2.Darwin` を作成:
+
+```ini
+[report]
+open = open
+```
+
+`Makefile`:
+
+```makefile
+install:
+	install -d $(DESTDIR)/.rhodes
+	install -m 644 config/lancet-2.$(shell uname -s) $(DESTDIR)/.rhodes/lancet-2
+```
+
+```console
+$ zmm install
+$ cat ~/.rhodes/lancet-2
+[report]
+open = xdg-open
+```
+
+- macOS なら `open = open` になる。
+
+### 5.5 復号
+
+`~/.zmm-demo/tmp/big-ugly` を作成:
+
+```ini
+[pilot]
+passcode = 0072
+```
+
+暗号化して置く:
+
+```sh
+gpg -c -o ~/.zmm-demo/src/config/big-ugly.gpg ~/.zmm-demo/tmp/big-ugly
+```
+
+`Makefile`:
+
+```makefile
+install:
+	install -d $(DESTDIR)/.rhodes
+	gpg -qd config/big-ugly.gpg > $(DESTDIR)/.rhodes/big-ugly
+	chmod 600 $(DESTDIR)/.rhodes/big-ugly
+```
+
+```console
+$ zmm install
+$ cat ~/.rhodes/big-ugly
+[pilot]
+passcode = 0072
+```
+
+- `src/` には暗号化したものだけが置かれる。`src/` を公開しても秘密は漏れない。
+- `~/.zmm-demo/local.git` には復号したものが記録される。こちらは公開しないこと。
+
+`gpg` の代わりに `age -d`、`sops -d`、`op read` (1Password)、`bw get` (Bitwarden) など、標準出力に出せる道具なら何でも使える。
+
+### 5.6 並列処理
+
+`Makefile`:
+
+```makefile
+install: build/lancet-2 build/big-ugly
+	install -d $(DESTDIR)/.rhodes
+	install -m 644 build/lancet-2 $(DESTDIR)/.rhodes/lancet-2
+	install -m 644 build/big-ugly $(DESTDIR)/.rhodes/big-ugly
+
+build/lancet-2:
+	mkdir -p build
+	curl -fsSL -o $@ https://raw.githubusercontent.com/kurubushi/zmm/master/demo/src1/config/lancet-2
+
+build/big-ugly:
+	mkdir -p build
+	curl -fsSL -o $@ https://raw.githubusercontent.com/kurubushi/zmm/master/demo/acahualla/big-ugly
+
+clean:
+	rm -rf build
+```
+
+`MAKEFLAGS` で `-j` を渡すと、2 つのダウンロードが同時に走る:
+
+```console
+$ MAKEFLAGS=-j zmm install
+$ ls ~/.rhodes
+big-ugly
+lancet-2
+```
+
+### 5.7 依存関係の解決
+
+`~/.zmm-demo/src/config/castle-3.in` を作成:
+
+```ini
+[greeting]
+assistant = hello, @USER@.
+```
+
+`Makefile`:
+
+```makefile
+install: install-$(shell hostname)
+
+install-server: build/castle-3 build/big-ugly
+	install -d $(DESTDIR)/.rhodes
+	install -m 644 build/castle-3 $(DESTDIR)/.rhodes/castle-3
+	install -m 644 build/big-ugly $(DESTDIR)/.rhodes/big-ugly
+
+install-client: build/castle-3
+	install -d $(DESTDIR)/.rhodes
+	install -m 644 build/castle-3 $(DESTDIR)/.rhodes/castle-3
+
+build/castle-3:
+	mkdir -p build
+	sed 's/@USER@/$(USER)/' config/castle-3.in > $@
+
+build/big-ugly:
+	mkdir -p build
+	curl -fsSL -o $@ https://raw.githubusercontent.com/kurubushi/zmm/master/demo/acahualla/big-ugly
+
+clean:
+	rm -rf build
+```
+
+`client` では、軽い処理 (`castle-3` の穴埋め) だけが走る。`-v` で、make が走らせたレシピを見る:
+
+```console
+$ hostname
+client
+$ zmm install -v
+make: Entering directory '/home/doctor/.zmm-demo/src'
+mkdir -p build
+sed 's/@USER@/doctor/' config/castle-3.in > build/castle-3
+install -d /home/doctor/.zmm-demo/draft/.rhodes
+install -m 644 build/castle-3 /home/doctor/.zmm-demo/draft/.rhodes/castle-3
+make: Leaving directory '/home/doctor/.zmm-demo/src'
+```
+
+- make は、`install` に必要なものだけを作る。`client` には要らない `build/big-ugly` は、ダウンロードされない。
+- `server` では、重い処理 (`big-ugly` のダウンロード) も走る。
+
+### 5.8 Makefile の分割 (recursive)
+
+`Makefile`:
+
+```makefile
+install:
+	$(MAKE) -C castle-3 install
+	$(MAKE) -C big-ugly install
 
 # ~/.zmm-demo/src
 # ├── Makefile
-# └── config
-#     ├── castle-3.in
-#     ├── lancet-2.Darwin
-#     └── lancet-2.Linux
+# ├── castle-3
+# │   ├── Makefile
+# │   └── config
+# └── big-ugly
+#     ├── Makefile
+#     └── config
 ```
 
-- `castle-3` は、`$USER` を埋めてインストールされる。
-- `lancet-2` は、OS ごとのファイルを選んでインストールされる。
-- `big-ugly` は、zmm の repository からダウンロードしてインストールされる。
+- `$(MAKE) -C` は、directory に入って make する。
+- `DESTDIR` は、子 `Makefile` の make にも引き継がれる。
 
-`big-ugly` のダウンロードは cache が効く。ダウンロードし直すなら clean install する:
+`castle-3/Makefile`:
 
-```sh
-zmm install --clean
+```makefile
+install:
+	install -d $(DESTDIR)/.rhodes
+	install -m 644 config $(DESTDIR)/.rhodes/castle-3
 ```
 
-- この cache は `make` の機能。`--clean` は、`make clean` してからインストールするだけ。
+- パスは `castle-3/` から書く。
+
+`big-ugly/Makefile` も同様。
+
+```console
+$ zmm install
+$ ls ~/.rhodes
+big-ugly
+castle-3
+```
+
+子 `Makefile` に必ず `install` と `clean` を用意することを約束すれば、次のように共通化することもできる:
+
+```makefile
+SUBDIRS :=
+SUBDIRS += castle-3
+SUBDIRS += big-ugly
+
+.PHONY: install clean $(SUBDIRS)
+
+install: $(SUBDIRS)
+
+clean: $(SUBDIRS:%=%-clean)
+
+$(SUBDIRS):
+	$(MAKE) -C $@ install
+
+$(SUBDIRS:%=%-clean):
+	$(MAKE) -C $(@:-clean=) clean
+```
+
+- 子 `Makefile` を足すときは `SUBDIRS` への追記だけで済む。
+- `-j` による並列処理が効くようになる。
+
+### 5.9 Makefile の分割 (non-recursive)
+
+`Makefile`:
+
+```makefile
+include castle-3/rules.mk
+include big-ugly/rules.mk
+
+# ~/.zmm-demo/src
+# ├── Makefile
+# ├── castle-3
+# │   ├── config
+# │   └── rules.mk
+# └── big-ugly
+#     ├── config
+#     └── rules.mk
+```
+
+- `include` は、ファイルを 1 つの `Makefile` に取り込む。
+
+`castle-3/rules.mk`:
+
+```makefile
+install: castle-3/install
+
+castle-3/install:
+	install -d $(DESTDIR)/.rhodes
+	install -m 644 castle-3/config $(DESTDIR)/.rhodes/castle-3
+```
+
+- パスはトップの `src/` から書く。
+- `install:` を何度書いても、前提 (`castle-3/install` など) が足されていくだけ。
+
+`big-ugly/rules.mk` も同様。
+
+```console
+$ zmm install
+$ ls ~/.rhodes
+big-ugly
+castle-3
+```
+
+### 5.10 ソフトウェアのインストール
+
+`Makefile`:
+
+```makefile
+install: build/hello
+	cp -R build/hello$(HOME)/. $(DESTDIR)/
+
+build/hello:
+	mkdir -p build
+	curl -fsSL https://ftp.gnu.org/gnu/hello/hello-2.12.1.tar.gz | tar xz -C build
+	cd build/hello-2.12.1 && ./configure --prefix=$(HOME)/.local
+	$(MAKE) -C build/hello-2.12.1
+	$(MAKE) -C build/hello-2.12.1 install DESTDIR=$(CURDIR)/$@
+
+clean:
+	rm -rf build
+```
+
+- zmm では `Makefile` のインストール先を `$(DESTDIR)` にしなければいけないことに注意。
+- ただし `--prefix` には実際のインストール先となる `$HOME/.local` を指定する。これはバイナリから参照されるパス。
+
+```console
+$ zmm install
+$ ~/.local/bin/hello
+Hello, world!
+```
+
+`Makefile` から消せばアンインストールされ、`zmm git revert` で前の版に戻せる。package manager のように使える。ただしインストールしたものはすべて `~/.zmm-demo/local.git` に commit log として記録され続けることに注意。
 
 ---
 
@@ -690,4 +1017,3 @@ git clone <your dotfiles repository> ~/.zmm/src
 ```
 
 - そのときは、`src/` を zmm の管理に入れないこと (Git は、repository の中のファイルを外の repository から `add` されても、黙って何もしない)。
-- `build/` のような中間の生成物は、`.gitignore` で除外しておく ([src4/.gitignore](src4/.gitignore))。

@@ -1,8 +1,0 @@
-[greeting]
-assistant = hello, @USER@.
-
-[shell]
-armor = thickest
-
-[drive]
-mode = 4wd

@@ -1,6 +1,0 @@
-[greeting]
-assistant = hi.
-
-[report]
-copy = pbcopy
-open = open

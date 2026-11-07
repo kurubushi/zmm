@@ -599,46 +599,373 @@ armor = thickest
 
 ## 5. Using the Makefile
 
-So far, the `Makefile` only `install`s the sources. A `Makefile` can also make dotfiles to fit the environment, or download them ([src4/](src4/)):
+So far, the `Makefile` only `install`s the sources. Here are recipes that only a `Makefile` can do.
 
-```sh
-rm -rf ~/.zmm-demo/src
-cp -R demo/src4 ~/.zmm-demo/src
+### 5.1 Fill in variables
+
+Create `~/.zmm-demo/src/config/castle-3.in`:
+
+```ini
+[greeting]
+assistant = hello, @USER@.
 ```
 
+`Makefile`:
+
 ```makefile
+install:
+	install -d $(DESTDIR)/.rhodes
+	sed 's/@USER@/$(USER)/' config/castle-3.in > $(DESTDIR)/.rhodes/castle-3
+```
+
+```console
+$ zmm install
+$ cat ~/.rhodes/castle-3
+[greeting]
+assistant = hello, doctor.
+```
+
+### 5.2 Generate files
+
+Create `~/.zmm-demo/src/build.sh`:
+
+```sh
+echo 'author = Zumama'
+```
+
+`Makefile`:
+
+```makefile
+install:
+	install -d $(DESTDIR)/.rhodes
+	sh build.sh > $(DESTDIR)/.rhodes/big-ugly
+```
+
+```console
+$ zmm install
+$ cat ~/.rhodes/big-ugly
+author = Zumama
+```
+
+### 5.3 Download files
+
+`Makefile`:
+
+```makefile
+.DELETE_ON_ERROR:
+
 install: build/big-ugly
 	install -d $(DESTDIR)/.rhodes
-	sed 's/@USER@/$(USER)/' config/castle-3.in >$(DESTDIR)/.rhodes/castle-3
-	install -m 644 config/lancet-2.$(shell uname -s) $(DESTDIR)/.rhodes/lancet-2
 	install -m 644 build/big-ugly $(DESTDIR)/.rhodes/big-ugly
 
 build/big-ugly:
 	mkdir -p build
-	curl -fsSL -o build/big-ugly https://raw.githubusercontent.com/kurubushi/zmm/master/demo/acahualla/big-ugly
+	curl -fsSL -o $@ https://raw.githubusercontent.com/kurubushi/zmm/master/demo/acahualla/big-ugly
+	echo '6a80ac6705726fb2da91a732b35f14446b66309ca94608b16a394617603cbcc9  $@' | sha256sum -c -
 
 clean:
 	rm -rf build
+```
+
+```console
+$ zmm install
+$ cat ~/.rhodes/big-ugly
+[pilot]
+autopilot = off
+
+[arms]
+body = large-caliber-cannon
+```
+
+Once downloaded, it is not downloaded again while it stays in `build/`. To download it again, run `zmm install --clean` (it runs `make clean` before the install).
+
+### 5.4 Branch by environment
+
+Create `~/.zmm-demo/src/config/lancet-2.Linux`:
+
+```ini
+[report]
+open = xdg-open
+```
+
+Create `~/.zmm-demo/src/config/lancet-2.Darwin`:
+
+```ini
+[report]
+open = open
+```
+
+`Makefile`:
+
+```makefile
+install:
+	install -d $(DESTDIR)/.rhodes
+	install -m 644 config/lancet-2.$(shell uname -s) $(DESTDIR)/.rhodes/lancet-2
+```
+
+```console
+$ zmm install
+$ cat ~/.rhodes/lancet-2
+[report]
+open = xdg-open
+```
+
+- On macOS, it is `open = open`.
+
+### 5.5 Decrypt
+
+Create `~/.zmm-demo/tmp/big-ugly`:
+
+```ini
+[pilot]
+passcode = 0072
+```
+
+Encrypt it into the sources:
+
+```sh
+gpg -c -o ~/.zmm-demo/src/config/big-ugly.gpg ~/.zmm-demo/tmp/big-ugly
+```
+
+`Makefile`:
+
+```makefile
+install:
+	install -d $(DESTDIR)/.rhodes
+	gpg -qd config/big-ugly.gpg > $(DESTDIR)/.rhodes/big-ugly
+	chmod 600 $(DESTDIR)/.rhodes/big-ugly
+```
+
+```console
+$ zmm install
+$ cat ~/.rhodes/big-ugly
+[pilot]
+passcode = 0072
+```
+
+- `src/` holds only the encrypted file. Publishing `src/` leaks no secret.
+- `~/.zmm-demo/local.git` records the decrypted file. Don't publish it.
+
+Instead of `gpg`, any tool that prints to stdout works: `age -d`, `sops -d`, `op read` (1Password), `bw get` (Bitwarden), and so on.
+
+### 5.6 Run in parallel
+
+`Makefile`:
+
+```makefile
+install: build/lancet-2 build/big-ugly
+	install -d $(DESTDIR)/.rhodes
+	install -m 644 build/lancet-2 $(DESTDIR)/.rhodes/lancet-2
+	install -m 644 build/big-ugly $(DESTDIR)/.rhodes/big-ugly
+
+build/lancet-2:
+	mkdir -p build
+	curl -fsSL -o $@ https://raw.githubusercontent.com/kurubushi/zmm/master/demo/src1/config/lancet-2
+
+build/big-ugly:
+	mkdir -p build
+	curl -fsSL -o $@ https://raw.githubusercontent.com/kurubushi/zmm/master/demo/acahualla/big-ugly
+
+clean:
+	rm -rf build
+```
+
+Pass `-j` with `MAKEFLAGS`, and the two downloads run at once:
+
+```console
+$ MAKEFLAGS=-j zmm install
+$ ls ~/.rhodes
+big-ugly
+lancet-2
+```
+
+### 5.7 Resolve dependencies
+
+Create `~/.zmm-demo/src/config/castle-3.in`:
+
+```ini
+[greeting]
+assistant = hello, @USER@.
+```
+
+`Makefile`:
+
+```makefile
+install: install-$(shell hostname)
+
+install-server: build/castle-3 build/big-ugly
+	install -d $(DESTDIR)/.rhodes
+	install -m 644 build/castle-3 $(DESTDIR)/.rhodes/castle-3
+	install -m 644 build/big-ugly $(DESTDIR)/.rhodes/big-ugly
+
+install-client: build/castle-3
+	install -d $(DESTDIR)/.rhodes
+	install -m 644 build/castle-3 $(DESTDIR)/.rhodes/castle-3
+
+build/castle-3:
+	mkdir -p build
+	sed 's/@USER@/$(USER)/' config/castle-3.in > $@
+
+build/big-ugly:
+	mkdir -p build
+	curl -fsSL -o $@ https://raw.githubusercontent.com/kurubushi/zmm/master/demo/acahualla/big-ugly
+
+clean:
+	rm -rf build
+```
+
+On `client`, only the light work (filling in `castle-3`) runs. See the recipes that make runs, with `-v`:
+
+```console
+$ hostname
+client
+$ zmm install -v
+make: Entering directory '/home/doctor/.zmm-demo/src'
+mkdir -p build
+sed 's/@USER@/doctor/' config/castle-3.in > build/castle-3
+install -d /home/doctor/.zmm-demo/draft/.rhodes
+install -m 644 build/castle-3 /home/doctor/.zmm-demo/draft/.rhodes/castle-3
+make: Leaving directory '/home/doctor/.zmm-demo/src'
+```
+
+- make makes only what `install` needs. `build/big-ugly`, which `client` doesn't need, is not downloaded.
+- On `server`, the heavy work (downloading `big-ugly`) runs too.
+
+### 5.8 Split the Makefile (recursive)
+
+`Makefile`:
+
+```makefile
+install:
+	$(MAKE) -C castle-3 install
+	$(MAKE) -C big-ugly install
 
 # ~/.zmm-demo/src
 # ├── Makefile
-# └── config
-#     ├── castle-3.in
-#     ├── lancet-2.Darwin
-#     └── lancet-2.Linux
+# ├── castle-3
+# │   ├── Makefile
+# │   └── config
+# └── big-ugly
+#     ├── Makefile
+#     └── config
 ```
 
-- `castle-3` is installed with `$USER` filled in.
-- `lancet-2` is installed from the file picked for the OS.
-- `big-ugly` is downloaded from the zmm repository, and installed.
+- `$(MAKE) -C` goes into the directory and makes there.
+- `DESTDIR` is passed down to the make of the child `Makefile`.
 
-The download of `big-ugly` is cached. To download it again, do a clean install:
+`castle-3/Makefile`:
 
-```sh
-zmm install --clean
+```makefile
+install:
+	install -d $(DESTDIR)/.rhodes
+	install -m 644 config $(DESTDIR)/.rhodes/castle-3
 ```
 
-- This cache is a feature of `make`. `--clean` just runs `make clean` before the install.
+- Write the paths from `castle-3/`.
+
+`big-ugly/Makefile` is alike.
+
+```console
+$ zmm install
+$ ls ~/.rhodes
+big-ugly
+castle-3
+```
+
+If you promise that every child `Makefile` has `install` and `clean`, you can also put them together like this:
+
+```makefile
+SUBDIRS :=
+SUBDIRS += castle-3
+SUBDIRS += big-ugly
+
+.PHONY: install clean $(SUBDIRS)
+
+install: $(SUBDIRS)
+
+clean: $(SUBDIRS:%=%-clean)
+
+$(SUBDIRS):
+	$(MAKE) -C $@ install
+
+$(SUBDIRS:%=%-clean):
+	$(MAKE) -C $(@:-clean=) clean
+```
+
+- To add a child `Makefile`, you only add it to `SUBDIRS`.
+- Parallel runs with `-j` work.
+
+### 5.9 Split the Makefile (non-recursive)
+
+`Makefile`:
+
+```makefile
+include castle-3/rules.mk
+include big-ugly/rules.mk
+
+# ~/.zmm-demo/src
+# ├── Makefile
+# ├── castle-3
+# │   ├── config
+# │   └── rules.mk
+# └── big-ugly
+#     ├── config
+#     └── rules.mk
+```
+
+- `include` takes the files into one `Makefile`.
+
+`castle-3/rules.mk`:
+
+```makefile
+install: castle-3/install
+
+castle-3/install:
+	install -d $(DESTDIR)/.rhodes
+	install -m 644 castle-3/config $(DESTDIR)/.rhodes/castle-3
+```
+
+- Write the paths from the top `src/`.
+- However many times you write `install:`, it just adds the prerequisites (`castle-3/install` and so on).
+
+`big-ugly/rules.mk` is alike.
+
+```console
+$ zmm install
+$ ls ~/.rhodes
+big-ugly
+castle-3
+```
+
+### 5.10 Install software
+
+`Makefile`:
+
+```makefile
+install: build/hello
+	cp -R build/hello$(HOME)/. $(DESTDIR)/
+
+build/hello:
+	mkdir -p build
+	curl -fsSL https://ftp.gnu.org/gnu/hello/hello-2.12.1.tar.gz | tar xz -C build
+	cd build/hello-2.12.1 && ./configure --prefix=$(HOME)/.local
+	$(MAKE) -C build/hello-2.12.1
+	$(MAKE) -C build/hello-2.12.1 install DESTDIR=$(CURDIR)/$@
+
+clean:
+	rm -rf build
+```
+
+- Note that zmm needs the `Makefile` to install into `$(DESTDIR)`.
+- But give `--prefix` the real place to install, `$HOME/.local`. It is the path that the binary refers to.
+
+```console
+$ zmm install
+$ ~/.local/bin/hello
+Hello, world!
+```
+
+Delete it from the `Makefile` and it is uninstalled. `zmm git revert` brings back the previous version. You can use zmm like a package manager. Note, however, that all that you install stays recorded in the commit log of `~/.zmm-demo/local.git`.
 
 ---
 
@@ -690,4 +1017,3 @@ git clone <your dotfiles repository> ~/.zmm/src
 ```
 
 - Then don't put `src/` under zmm (Git silently does nothing when a repository outside `add`s files in a repository).
-- Leave intermediate output like `build/` out with `.gitignore` ([src4/.gitignore](src4/.gitignore)).
